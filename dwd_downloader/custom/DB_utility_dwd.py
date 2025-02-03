@@ -1,0 +1,1702 @@
+# -*- coding: utf-8 -*-
+"""
+@author: Aranil
+
+Methods to request Data from the DWD server at https://opendata.dwd.de/climate_environment/CDC/
+
+DWD specific functions for database
+
+"""
+import os
+import requests
+import numpy as np
+import shapely
+from bs4 import BeautifulSoup
+import tempfile
+from pathlib import Path
+from urllib.request import urlopen
+import zipfile
+import pandas as pd
+from datetime import datetime
+import dbflow.src.db_sqlalchemy as cstm
+from dbflow.src.db_utility import connect2db, create_sql, query_sql
+from datetime import date
+from dateutil.parser import parse
+from collections import OrderedDict
+
+from custom import definitions
+import config as cfg
+
+
+
+#TODO: implement weather auf daily basis!!!!!!
+
+import logging
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+
+class DWDData(object):
+    '''
+
+    Class to handle DWD Data; allows download of phenology and climate data from https://opendata.dwd.de/;
+    as well as import of the data into DB
+
+
+    Parameters
+    ----------
+    data_type: str
+         "climate" or "phenology"
+    report_type: str
+        "historical" or  "recent"
+    report_resolution: str
+        for data_type climate: "hourly" or " daily"
+        for data_type phenology: "annual" or "immediate"
+
+    '''
+
+    __slots__ = ['data_type', 'report_type', 'wd_report', 'phen_report']
+
+    def __init__(self, data_type, report_type, report_resolution):
+        if isinstance(data_type, str) and isinstance(report_type, str) and isinstance(report_type, str):
+            self.data_type = data_type
+            self.report_type = report_type
+            if data_type == 'climate':
+                self.wd_report = report_resolution
+            if data_type == 'phenology':
+                self.phen_report = report_resolution
+        else:
+            raise TypeError('should be of type str!')
+
+
+    def build_url(self):
+        """
+        Constructs URLs for downloading DWD (German Weather Service) data via HTTPS.
+
+        This method builds URLs for climate and phenology data based on specified data types, report types,
+        and report resolutions. The URLs are scraped from the DWD's open data portal and returned in a dictionary format.
+
+        Returns
+        -------
+        dict
+            A dictionary where each key is a data parameter (e.g., 'air_temperature') and each value is the URL
+            for accessing the corresponding DWD data. For example:
+
+            {'air_temperature': 'https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/air_temperature/recent/'}
+
+        Notes
+        -----
+        - This method assumes that `self.report_type`, `self.data_type`, `self.wd_report`, and `self.phen_report` are
+          already set with appropriate values.
+        - `self.data_type` should be either 'climate' or 'phenology' to build URLs correctly.
+        - The URLs generated are specific to the German Weather Service (DWD) open data repository.
+
+        Example
+        -------
+        >>> dwd_dict = build_url()
+        >>> print(dwd_dict)
+        {'air_temperature': 'https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/air_temperature/recent/'}
+        """
+
+        dwd_parameter_colection = {}
+        FTP_Root = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/"
+        ReportTimeNode = "{}/".format(self.report_type)
+        DataTypeNode = "{}/".format(self.data_type)
+
+        # Define the report node based on data type
+        if self.data_type == "climate":
+            DataReportNode = "{}/".format(self.wd_report)
+        elif self.data_type == "phenology":
+            DataReportNode = "{}_reporters/".format(self.phen_report)
+
+        # Build the base URL
+        url = "{}{}{}".format(FTP_Root, DataTypeNode, DataReportNode)
+
+        # Scrape the webpage for relevant links
+        html = requests.get(url, stream=True)
+        soup = BeautifulSoup(html.text, 'html.parser')
+        for entry in soup.find_all('a', href=True):
+            if not entry['href'].startswith('..'):
+                link = "{}{}{}{}{}".format(FTP_Root, DataTypeNode, DataReportNode, entry['href'], ReportTimeNode)
+                dwd_parameter_colection[entry['href'].split('/')[0]] = link
+
+        return dwd_parameter_colection
+
+
+    def extract_data(self, search_after, dwd_parameter_url):
+        """
+        Extract climate data from a specified DWD parameter URL, including measurements with quality data and station information.
+
+        Parameters
+        ----------
+        search_after : str, int, or list of str or int
+            For data_type='phenology': a list of crop types or parameters or filenames.
+            For data_type='climate': station ID(s) as a list of integers or a pattern for station information files.
+
+        dwd_parameter_url : str
+            URL to the DWD parameter directory, typically generated by `DWData.build_url()`.
+
+        Returns
+        -------
+        dict
+            A dictionary with `station_id` or file name as keys and URLs for data extraction as values.
+        """
+        # Ensure search_unit is defined
+        search_unit = dwd_parameter_url.split('/')[-3]
+
+        # Validate `search_after`
+        if not isinstance(search_after, (str, int, list)):
+            logger.error(
+                "Invalid type for 'search_after'. Expected str, int, or list, got {}.".format(type(search_after)))
+            return {}
+
+        # Prepare `st_variable` based on `search_after`
+        if isinstance(search_after, list):
+            if not all(isinstance(val, (str, int)) for val in search_after):
+                logger.error("Invalid list elements in 'search_after'. Expected str or int values only.")
+                return []
+            st_variable = [str(i).zfill(5) if isinstance(i, int) else i for i in search_after]
+        else:
+            st_variable = [str(search_after).zfill(5) if isinstance(search_after, int) else search_after]
+
+        # Validate `dwd_parameter_url`
+        if not isinstance(dwd_parameter_url, str) or not dwd_parameter_url.startswith("http"):
+            logger.error("Invalid 'dwd_parameter_url'. Expected a URL string, got {}.".format(dwd_parameter_url))
+            return {}
+
+        # Extract climate data
+        qdata_dict = {}
+        url = dwd_parameter_url
+        html = requests.get(url, stream=True)
+
+        # Check response and parse HTML content if accessible
+        if html.status_code == 200:
+            soup = BeautifulSoup(html.text, 'html.parser')
+            for entry in soup.find_all('a', href=True):
+                if not entry['href'].startswith('..'):
+                    for unit_number in st_variable:
+                        if unit_number in entry['href']:
+                            link = "{}{}".format(url, entry['href'])
+                            fullname_unit_number = link.split('/')[-1].split('.')[0]
+                            qdata_dict[fullname_unit_number] = link
+        else:
+            logger.info("No extractable file available for DWD parameter '{}' at URL: {}".format(search_unit,
+                                                                                                 dwd_parameter_url))
+            logger.info('HTML response code: {}'.format(html.status_code))
+
+        return qdata_dict
+
+
+    @ staticmethod
+    def points_from_xy(x, y):
+        '''
+        creates WKT geometry from lat, long coordinates
+
+        returns shapely.geometry.Point object
+        '''
+        return shapely.geometry.Point(float(x), float(y))
+
+
+    #TODO: Consider to make the unified function for __read_wd_stations and  __read_phen_stations
+
+    #---------------------------------------------------
+    # functions to read different txt files
+    #----------------------------------------------------
+    def __read_phen_stations(self, txt_file, phen_parameter):
+        """
+        Reads station descriptions for data_type='phenology' from a text file and processes them into a standardized format.
+
+        The function reads data from a specified .txt file into a DataFrame, renames columns based on a predefined dictionary,
+        and prepares a GeoDataFrame with geometry information in WKT format. Additional metadata columns are also included
+        based on the `phen_parameter`.
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to the .txt file containing station descriptions. i.g. https://opendata.dwd.de/climate_environment/CDC/observations_germany/phenology/immediate_reporters/crops/historical/PH_Beschreibung_Phaenologie_Stationen_Sofortmelder.txt
+        phen_parameter : str
+            DWD parameter indicating the type of phenology data, such as 'crops', 'vine', 'fruit', 'wild', etc.
+
+        Returns
+        -------
+        dict
+            A dictionary containing processed data with the following keys:
+            - 'stations': A GeoDataFrame containing station data with standardized columns and WKT geometry.
+            - 'pheno_parameter_code': A DataFrame with unique phenology parameter codes and associated descriptions.
+
+        Notes
+        -----
+        - Column names are standardized based on `dwd_downloader.custom.definitions.colnames_PStat`.
+        - Geometry is generated from longitude and latitude and stored as WKT.
+        - If the report type in the file name does not match the expected `self.phen_report`, a log message is generated.
+
+        Example
+        -------
+        >>> result = self.__read_phen_stations("path/to/file.txt", "crops")
+        >>> stations_df = result['stations']
+        >>> parameter_code_df = result['pheno_parameter_code']
+        """
+
+        # Read data into a DataFrame and clean up whitespace
+        try:
+            df = pd.read_csv(txt_file, sep=';', encoding='ANSI', dtype='str', skipinitialspace=True)[:-1]
+        except Exception as e:
+            logger.error(f"Failed to read {txt_file}: {e}")
+            return {}
+
+        # Strip whitespace from columns and values
+        df.columns = df.columns.str.strip()
+        for col in df.columns.values.tolist():
+            df[col] = df[col].str.strip()
+
+        # Filter out unwanted columns
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['eor', 'Unnamed: 12'])))
+        df = df[wd_code_origin]
+
+        # Extract main phenology code and report type from filename
+        phen_main_code = txt_file.split('/')[-1].split('.')[0].split('_')[0]
+        txt_report_type = txt_file.split('/')[-1].split('.')[0].split('_')[4]
+
+        # Verify that report type matches expected value
+        if self.phen_report != definitions.dict_phen_report_types[txt_report_type]:
+            logger.info("Mismatch: report type '{}' does not match the file name '{}'.".format(self.phen_report,
+                                                                                               definitions.dict_phen_report_types[
+                                                                                                   txt_report_type]))
+
+        for wd_code in wd_code_origin:
+            template_dict = {}
+            #template_dict['key'] = phen_main_code   # PH
+            template_dict['key2'] = wd_code  # origin DWD colnames
+            # template_dict['key3'] = self.report_type
+            template_dict['name'] = phen_parameter    #Kartoffel
+
+        # Rename columns using a predefined dictionary (from german to english)
+        df = df.rename(columns=definitions.colnames_PStat)
+
+        # Convert all numeric columns to float where possible
+        for col in ['geo_lat', 'geo_lon', 'height', 'naturegroup_code', 'nature_code']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+
+        # Create geometry column with WKT format based on longitude and latitude
+        df['geometry'] = df.apply(lambda x: DWDData.points_from_xy(x.geo_lon, x.geo_lat), axis=1)
+        #gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.geo_lon, df.geo_lat)) # other way to crete geometry column
+        df['geometry_wkt'] = df.geometry.apply(
+            lambda x: cstm.Geometry2().bind_expression(bindvalue=x, srid=4326) if x else None)
+        df = df.drop('geometry', axis=1) # Remove geometry column after conversion to WKT
+
+        # Assign additional metadata columns
+        df = df.assign(report_type=self.report_type, report_resolution=self.phen_report)
+        df_param_code = df.assign(parameter=phen_parameter,
+                         parameter_code=phen_main_code, parameter_description=None, unit=None)
+
+        pheno_parameter_code = df_param_code[['parameter_code', 'parameter', 'parameter_description', 'unit']].drop_duplicates()
+
+        # Return processed data in a dictionary
+        return {
+                  'stations': df
+                , 'pheno_parameter_code': pheno_parameter_code
+                #, 'dwd_legend': dwd_legend
+                }
+
+
+    def __read_phen_data(self, txt_file): # , phen_parameter
+        """
+        Reads observation records for data_type='phenology' from a specified text file and processes them into a standardized format.
+
+        The function loads data from the specified .txt file into a DataFrame, renames columns based on a predefined dictionary,
+        and adds metadata columns. If the file structure differs from expected, an empty DataFrame is returned, and a log message
+        is generated.
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to the .txt file containing phenology observation records.
+
+        Returns
+        -------
+        dict
+            A dictionary containing processed data with the following keys:
+            - 'measurements': A DataFrame with observation data, renamed columns, and added metadata.
+            - 'dwd_legend': A DataFrame with unique metadata entries, including station information and parameter codes.
+
+        Notes
+        -----
+        - Expected column names are renamed based on `dwd_downloader.custom.definitions.colnames_PD`.
+        - If 'Objekt_id' is found, it validates against `dwd_downloader.custom.definitions.phenodata_codes` to ensure consistency with `object_main_code`.
+        - If the file has an unexpected structure, it logs a warning and returns empty DataFrames.
+
+        Example
+        -------
+        >>> result = __read_phen_data("path/to/file.txt")
+        >>> measurements_df = result['measurements']
+        >>> legend_df = result['dwd_legend']
+        """
+
+        # Load data into a DataFrame with necessary pre-processing
+        df = pd.read_csv(txt_file, sep=';', decimal=' ', encoding='ANSI', engine='python', dtype='str', skipinitialspace=True)[:-1]
+        #columnnames = [x.lowwer() for x in df.columns.values.tolist()]
+
+        # Identify columns relevant to the data structure
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['eor', 'Unnamed: 9'])))
+        df = df[wd_code_origin]
+
+        # Extract key identifiers from the file name
+        object_main_code = txt_file.split('/')[-1].split('_')[4]
+        phen_parameter = txt_file.split('/')[-1].split('_')[2]
+        phen_main_code = txt_file.split('/')[-1].split('.')[0].split('_')[0]
+
+        # Format all column names so only the first letter is uppercase
+        df.columns = [col.capitalize() for col in df.columns]
+
+        # Rename columns according to predefined dictionary and add metadata
+        df = df.rename(columns=definitions.colnames_PD)
+        df = df.assign(report_type=self.report_type, report_resolution=self.phen_report, datatype_code=self.data_type,
+                       parameter=
+                       definitions.dict_phen_parameter_types[
+                           phen_parameter])  # main_object=definitions.phenodata_codes[str(objid)],
+
+
+        # Check for 'Objekt_id' and validate against expected codes
+        if 'Objekt_id' in df.columns:
+            if len(df['Objekt_id'].unique()) > 1:
+                logger.info('Multiple Objekt_id(s) found in the file.')
+
+            for objid in df['Objekt_id'].unique():
+                if object_main_code != definitions.phenodata_codes.get(str(objid), None):
+                    logger.info('Objekt_id: {} does not match the expected file name: {}'.format(
+                        object_main_code, definitions.phenodata_codes.get(str(objid), 'Unknown')
+                    ))
+
+            for wd_code in wd_code_origin:
+                template_dict = {}
+                #template_dict['key'] = phen_parameter  #Kartoffel
+                template_dict['key2'] = wd_code  # origin DWD colnames
+                # template_dict['key3'] = self.report_type
+                template_dict['name'] = phen_parameter
+
+            # Create 'dwd_legend' DataFrame with unique metadata entries
+            df_legend = df.assign(parameter_code=phen_main_code)
+            dwd_legend = df_legend.loc[:, df_legend.columns.isin(
+                ['station_id', 'reference_year', 'datatype_code', 'parameter_code', 'parameter', 'report_type', 'report_resolution'])]
+        else:
+            # Log a warning if file structure does not match expectations
+            logger.info('TXT file: {} has an unexpected structure and columns.'.format(txt_file.split('/')[-1]))
+
+            # Return empty DataFrames to skip data import
+            df = df[0:0]
+            dwd_legend = df[0:0]
+
+        # Return processed data
+        return {
+                   'measurements': df
+                 , 'dwd_legend': dwd_legend
+                #, 'quality_control': df_qc # there is no an extra file as it is the case for data_type='climate'
+                }
+
+
+    def __read_phen_anomaly(self,  txt_file, phen_parameter):
+        """
+        Reads anomaly records for data_type='phenology' from a specified text file and processes them into a standardized format.
+
+        This method loads anomaly data from the specified .txt file into a DataFrame, renames columns based on a predefined dictionary,
+        and adds metadata columns for consistent representation. The processed data is returned as a dictionary with the 'metadata' key.
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to the .txt file containing anomaly records.
+        phen_parameter : str
+            DWD parameter indicating the type of phenology data, such as 'crops', 'vine', 'fruit', 'wild', etc.
+
+        Returns
+        -------
+        dict
+            A dictionary containing processed data with the following key:
+            - 'metadata': A DataFrame with anomaly records, renamed columns, and added metadata.
+
+        Notes
+        -----
+        - Column names are standardized based on `dwd_downloader.custom.definitions.colnames_PAnnomal`.
+        - Whitespace is stripped from all columns for consistency.
+        - Metadata columns include report type, resolution, parameter, and data type code, providing context for the data.
+
+        Example
+        -------
+        >>> result = __read_phen_anomaly("path/to/anomaly_file.txt", "crops")
+        >>> metadata_df = result['metadata']
+        """
+        # Load header and split columns based on delimiter
+        header = pd.read_csv(txt_file, sep=r"[ ]{2; }", engine='python', encoding='ANSI', skipinitialspace=True)[:0]
+        header_list = header.columns.values.tolist()[0].split(';')
+
+        # Load data and split into columns based on header
+        df = pd.read_csv(txt_file, sep=r"[ ]{2; }", header=None, skiprows=1, engine='python', encoding='ANSI', skipinitialspace=True)[:-1]
+        df = pd.DataFrame(df[0].str.split(';').tolist(), columns=header_list + [''])
+
+        # Filter out unwanted columns
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['eor', ''])))
+        df = df[wd_code_origin]
+
+        # Extract phenology main code from file name
+        phen_main_code = txt_file.split('/')[-1].split('.')[0].split('_')[0]
+        for wd_code in wd_code_origin:
+            template_dict = {}
+            #template_dict['key'] = phen_main_code
+            template_dict['key2'] = wd_code  # origin DWD colnames
+            # template_dict['key3'] = self.report_type
+            template_dict['name'] = phen_parameter # Obst, Wildwachsende_Pflanze
+
+        # Rename columns according to predefined dictionary
+        df = df.rename(columns=definitions.colnames_PAnnomal)
+        # Add metadata columns
+        df = df.assign(report_type=self.report_type,
+                       report_resolution=self.phen_report,
+                       parameter=phen_parameter,
+                       datatype_code=self.data_type,
+                       parameter_code=phen_main_code)
+
+        # Strip whitespace from all columns
+        for col in df.columns.values.tolist():
+            df[col] = df[col].str.strip()
+
+        # Return processed data as a dictionary
+        return {
+                'metadata': df
+                }
+
+
+    def __read_phen_phasedefenition(self, txt_file): #, phen_parameter
+        """
+        Reads phase definitions for data_type='phenology' from a specified text file and processes them into a standardized format.
+
+        This method loads phase definition data from the specified .txt file into a DataFrame, renames columns based on a predefined dictionary,
+        and adds metadata columns. It also extracts unique object and phase codes to provide reference data for further analysis.
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to the .txt file containing phase definitions for phenology.
+
+        Returns
+        -------
+        dict
+            A dictionary containing processed data with the following keys:
+            - 'metadata': A DataFrame with phase definitions, renamed columns, and added metadata.
+            - 'object_unique_code': A DataFrame with unique object IDs and names, useful for referencing specific phenology objects.
+            - 'phase_unique_code': A DataFrame with unique phase IDs and names, useful for referencing specific phases in the dataset.
+
+        Notes
+        -----
+        - Column names are standardized based on `dwd_downloader.custom.definitions.colnames_PMeta`.
+        - Additional metadata columns are added to ensure consistency with other phenology data.
+        - If the main object or report type in the file name does not match expected values, log messages are generated.
+
+        Example
+        -------
+        >>> result = __read_phen_phasedefenition("path/to/phase_definitions.txt")
+        >>> metadata_df = result['metadata']
+        >>> object_codes_df = result['object_unique_code']
+        >>> phase_codes_df = result['phase_unique_code']
+        """
+
+        # Load data into a DataFrame
+        df = pd.read_csv(txt_file, sep=';',  encoding='ANSI', dtype='str', skipinitialspace=True)[:-1]
+
+        # Filter out unwanted columns
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['eor', 'Unnamed: 8'])))
+        df = df[wd_code_origin]
+
+        # Extract key identifiers from the file name
+        phen_parameter = txt_file.split('/')[-1].split('.')[0].split('_')[4]
+        phen_main_code = txt_file.split('/')[-1].split('.')[0].split('_')[0]
+
+        # Initialize a dictionary to keep track of missing parameters and associated errors
+        missing_parameters = {}
+
+        # Check if the phen_parameter exists in dict_phen_parameter_types
+        if phen_parameter in definitions.dict_phen_parameter_types:
+            # If it exists, proceed with the comparison
+            if definitions.dict_phen_parameter_types[phen_parameter] != txt_file.split('/')[-3]:
+                # Your existing condition here
+                print("Mismatch between parameter type and directory structure.")
+        else:
+            # If phen_parameter does not exist in the dictionary, add an error message
+            missing_parameters[phen_parameter] = f"{phen_parameter} is not defined in dict_phen_parameter_types."
+
+        # After the check, inspect missing_parameters for any errors found
+        if missing_parameters:
+            print("Errors found in parameters:", missing_parameters)
+
+        # Validate main object consistency with expected values
+        if definitions.dict_phen_parameter_types[phen_parameter] != txt_file.split('/')[-3]:
+            logger.info('main_object:{} does not match the file name:{}.'.format(
+                definitions.dict_phen_parameter_types.get(phen_parameter, 'Unknown'), txt_file.split('/')[-3]))
+
+        # Validate report type consistency with expected values
+        txt_report_type = txt_file.split('/')[-1].split('.')[0].split('_')[3]
+        if self.phen_report != definitions.dict_phen_report_types.get(txt_report_type, None):
+            logger.info('report_type:{} does not match the file name:{}.'.format(
+                self.phen_report, definitions.dict_phen_report_types.get(txt_report_type, 'Unknown')))
+
+        for wd_code in wd_code_origin:
+            template_dict = {}
+            #template_dict['key'] = phen_main_code  # PH
+            template_dict['key2'] = wd_code  # origin DWD colnames
+            # template_dict['key3'] = self.report_type
+            template_dict['name'] = phen_parameter     # Obst, Wildwachsende_Pflanze
+
+        # Rename columns according to predefined dictionary
+        df = df.rename(columns=definitions.colnames_PMeta)
+
+        # Add metadata columns for consistency
+        df = df.assign(report_type=self.report_type, report_resolution=self.phen_report, parameter=definitions.dict_phen_parameter_types[phen_parameter], parameter_code=phen_main_code) #main_object=definitions.dict_phen_parameter_types[phen_parameter],
+
+        # Strip whitespace from all column values for consistency
+        for col in df.columns.values.tolist():
+            df[col] = df[col].str.strip()
+
+        # Extract unique codes for objects and phases
+        object_unique_code = df[['object_id', 'object']].drop_duplicates()
+        phase_unique_code = df[['phase_id', 'phase']].drop_duplicates()
+
+        # Return processed data as a dictionary
+        return {
+                  'metadata': df
+                , 'object_unique_code': object_unique_code
+                , 'phase_unique_code': phase_unique_code
+                }
+
+
+
+    def __read_wd_stations(self, txt_file): #, wd_parameter, wd_main_code
+        '''
+        method to read stations description of the data_type='climate' from a txt file
+
+        reads data to a dataframe and renames the column names
+        defined in dwd_downloader.custom.definitions.colnames_WStat dictionary
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to read .txt file
+            e.g. https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/air_temperature/recent/TU_Stundenwerte_Beschreibung_Stationen.txt
+        wd_parameter: str
+            DWD parameter of the data_type='climate': air_temperature, cloud_type, cloudiness...
+        wd_main_code: str
+            WD code: TU, CS, N ... defined by DWD
+
+        Returns
+        -------
+            dictionary
+                key: 'stations'
+                value: geo dataframe
+        '''
+
+        # extract the table column names
+        header = pd.read_csv(txt_file, sep=';', encoding='ANSI', dtype='str')[:0]
+        header_list = header.columns.values.tolist()[0].split(' ')
+
+        # read data to dataframe with colnames
+        df = pd.read_csv(txt_file,
+                         sep=r"\s+",
+                         # skiprows=0,
+                         # header=None,
+                         engine='python',
+                         encoding='ANSI',
+                         skipinitialspace=True,
+                         on_bad_lines="skip")
+
+
+        # Rename the column 'Stations_id' to 'station_id'
+        df = df.rename(columns={'Stations_id': 'station_id', 'Abgabe':'access'})
+
+        for col_name in ['geoBreite', 'geoLaenge', 'station_id','Stationshoehe']:
+            df[col_name] = pd.to_numeric(df[col_name], errors='coerce')
+
+        # Drop rows where 'station_id' is NaN (no need to assign back if inplace=True is used)
+        df.dropna(subset=['station_id'], inplace=True)
+
+        # Check the updated DataFrame
+        # check if colnames equal amount of columns! if equal another read implementation is needed.
+        if len(header_list) != len(df.columns.values.tolist()):
+            logger.info('amount of column names do not correspond amount of columns !')
+
+            df = df.rename(columns={4: header_list[7], 1: header_list[3], 2: header_list[4]})
+            df1 = pd.DataFrame(df[0].str.split(' ', 2).tolist(), columns=header_list[:3])
+            df3 = pd.DataFrame(df[3].str.split(' ', 1).tolist(), columns=header_list[5:7])
+            dfrm = pd.concat([df1, df[header_list[3:5]], df3, df[[header_list[7]]]], axis=1)
+
+            for col in ['geo_lat', 'geo_lon', 'height']:
+                dfrm[col] = pd.to_numeric(dfrm[col], errors='coerce')
+        else:
+            logger.info('amount of column names correspond amount of columns !')
+            dfrm=df
+
+        # prepare geometry objects for insert in DB as Geometry
+        dfrm['geometry'] = dfrm.apply(lambda x: DWDData.points_from_xy(x.geoLaenge, x.geoBreite), axis=1)
+        #gdf = gpd.GeoDataFrame(dfrm, geometry=gpd.points_from_xy(dfrm.geoLaenge, dfrm.geoBreite)) # another way to create geometry column geometry entries
+        dfrm['geometry_wkt'] = dfrm.geometry.apply(
+                lambda x: cstm.Geometry2().bind_expression(bindvalue=x, srid=4326) if x else None)
+        dfrm = dfrm.drop('geometry', axis=1)
+        dfrm = dfrm.rename(columns=definitions.colnames_WStat)
+        dfrm = dfrm.assign(report_type=self.report_type, report_resolution=self.wd_report)
+
+        return {
+            'stations': dfrm
+        }
+
+
+
+    def __read_wd_metadata(self, txt_file, wd_parameter, wd_main_code):
+        '''
+        method to read metadata of the data_type='climate' from a txt file
+
+        reads metadata to a dataframe and renames the column names
+        defined in dwd_downloader.custom.definitions.colnames_WMeta dictionary
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to read .txt file
+        wd_parameter: str
+            DWD parameter of the data_type='climate': air_temperature, cloud_type, cloudiness...
+        wd_main_code: str
+            WD code: TU, CS, N ... defined by DWD
+
+        Returns
+        -------
+            dictionary
+                key: 'metadata'
+                value: dataframe
+
+       '''
+        df = pd.read_csv(txt_file, sep=';', decimal='.', encoding='ANSI', dtype='str', skipinitialspace=True)[:-2]  # dtype= {‘a’: np.float64, ‘b’: np.int32}
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['eor', 'Unnamed: 12'])))
+        df = df[wd_code_origin]
+
+        # wd_code_origin = df.columns.values.tolist()
+
+        # ----------extract measurements
+        for wd_code in wd_code_origin:
+            template_dict = {}
+            template_dict['key'] = wd_main_code
+            #template_dict['key2'] = wd_code
+            #template_dict['key3'] = self.report_type
+            #template_dict['name'] = wd_parameter
+
+        df = df.rename(columns=definitions.colnames_WMeta)
+        #----  change parameter values to a nsimple one >>> air_temperature RF_TU / TT_TU >>>
+        # air_temperature_tt_tu /air_temperature_rf_tu >>> 'air_temperature_200'/'relative_humidity_200'
+        dfrm = pd.DataFrame()
+        for wdcode in df['parameter_code'].unique():
+            #print('wdcode: ', wdcode)
+            new_column_name = '_'.join([wd_parameter, wdcode.lower()])
+            #print('new_column_name', new_column_name)
+            if new_column_name in list(definitions.colnames_WDH.keys()):
+                parameter_value = definitions.colnames_WDH[new_column_name]
+            else:
+                parameter_value = '* not imported into table weatherdata and not defined in definitions.py file yet !'
+            # select only row with wd code to assign a new columns
+            #print(df.loc[df['parameter_code'] == wdcode])
+            # Create a temporary DataFrame from the filtered data and the new columns
+            temp_df = df.loc[df['parameter_code'] == wdcode].assign(
+                report_type=self.report_type,
+                report_resolution=self.wd_report,
+                parameter=parameter_value,
+                parameter_dwd=new_column_name,
+                datatype_code=self.data_type
+            )
+
+            # Concatenate dfrm and temp_df
+            dfrm = pd.concat([dfrm, temp_df], ignore_index=True)
+        df_meta = dfrm.loc[:, ~dfrm.columns.isin(
+            ['datatype_name', 'unit', 'parameter', 'parameter_dwd', 'parameter_description', 'station_name', 'datatype_code'])]
+        # unique codes for object and phase
+        wd_parameter_code = dfrm.loc[:, dfrm.columns.isin(
+            ['parameter_code', 'parameter', 'parameter_dwd', 'parameter_description', 'unit'])].drop_duplicates()
+        dwd_legend = dfrm.loc[:, dfrm.columns.isin(
+            ['station_id', 'date_start', 'date_end', 'datatype_code', 'parameter', 'report_type', 'report_resolution',
+             'parameter_code'])]
+
+        return {
+                  'metadata': df_meta
+                , 'wd_parameter_code': wd_parameter_code
+                , 'dwd_legend': dwd_legend
+                }
+
+
+    def __read_wd_data(self, txt_file, wd_parameter, wd_main_code, reject_nondef_parameters=False):
+        """
+        reads climate data to a dataframe and renames the column names defined in dwd_downloader.custom.definitions.colnames_WDH dictionary
+
+        reject_nondef_parameters = True >>> returns table with only defined in (definitions.py) column names
+        if reject_nondef_parameters = False >>> returns dataframe with all existing 'original' colnames defined by DWD (exmp. air_temperature_TU);
+        check if Table in 'db_structure' with corresponding column names are exists, if not create it manualy
+
+        returns original NaN values: -999, NaN, '-999.0' ... use DWData.replace_nan(..) to convert all NaN values to None to be able insert data to DB
+
+        Parameters
+        ----------
+        txt_file : str
+            Path/Link to read .txt file
+        wd_parameter: str
+            DWD parameter of the data_type='climate': air_temperature, cloud_type, cloudiness...
+        wd_main_code:  str
+            WD code: TU, CS, N ... defined by DWD
+        reject_nondef_parameters boolean
+            True >>> returns table with only defined in (definitions.py) column names
+            False >>> returns dataframe with all existing 'original' colnames defined by DWD (exmp. air_temperature_TU);
+
+        Returns
+        -------
+            dictionary
+                key: 'measurements' or 'quality_control'
+                value: dataframe
+
+        """
+        df = pd.read_csv(txt_file, sep=';', decimal=' ', encoding='ANSI', engine='python', skipinitialspace=True)
+        # print(df.columns.values.tolist())
+        wd_code_origin = list(set(df.columns.values.tolist()).difference(set(['STATIONS_ID', 'MESS_DATUM', 'eor'])))
+
+        # ----------extract measurements
+        wd_code_collection = [i for i in wd_code_origin if not i.startswith('QN')]
+        # def extract_data2df(parameter = code_collection, colname_function=x.lower()):
+        df_wd = pd.DataFrame(columns=['station_id', 'datetime'])
+        # restructure df to a vertical wise structure
+        for wd_code in wd_code_collection:
+            colnames = ['STATIONS_ID', 'MESS_DATUM'] + [wd_code]
+            dfr = df.drop(columns='eor')
+            for column in dfr.columns:
+                if column == 'STATIONS_ID':
+                    dfr = dfr.rename(columns={column: 'station_id'})
+                elif column == 'MESS_DATUM':
+                    dfr = dfr.rename(columns={column: 'datetime'})
+                elif column.startswith('QN'):
+                    dfr = dfr.assign(quality_level_code=column)
+                    dfr = dfr.rename(columns={column: 'quality_level'})
+                elif column == wd_code:
+                    dfr = dfr.assign(parameter_code=column)
+                    dfr = dfr.rename(columns={column: 'parameter_value'})
+
+            # rewrite value -999 to a None
+            for i in ['-999', '-999.0', -999, -999.0]:
+                dfr.loc[dfr['parameter_value'] == -999, 'parameter_value'] = None
+            df_cut_measure = dfr[['station_id', 'datetime', 'quality_level',
+                                'parameter_value', 'quality_level_code',
+                                'parameter_code']]
+            #df_wd = df_wd.append(df_cut_measure) #depricated since 1.4.0
+            df_wd = pd.concat([df_wd, df_cut_measure], ignore_index=True)
+
+
+        # add dwd attributes
+        df_wd = df_wd.assign(report_type=self.report_type, report_resolution=self.wd_report, datatype_code=self.data_type)
+
+        #df_legend = df_wd.assign(parameter=wd_parameter, parameter_code=wd_main_code)
+        #dwd_legend = df_legend.loc[:, df_legend.columns.isin(
+        #        ['station_id', 'datetime', 'datatype_code', 'parameter', 'report_type', 'report_resolution', 'parameter_code'])]
+        return {
+                      'measurements': df_wd
+                    #, 'quality_control': df_qc_main
+                    #, 'dwd_legend': dwd_legend
+                    }
+
+    # ---------------------------------------------------------------
+    # functions to entpack zip files and retrieve  needed txt files
+    # ---------------------------------------------------------------
+    def __retrive_files(self, zipurl, cachdir, file_pattern='produkt', file_extension='.txt'):
+        """
+        Method to read measurements and metadata of the data_type='climate' from a zip file.
+
+        Parameters
+        ----------
+        zipurl: str
+            URL to zip folder to be unpacked
+        cachdir: str
+            Temporary directory to unzip file and extract data for reading
+        file_pattern: str
+            'Metadaten_Parameter' or 'produkt'
+        file_extension: str
+            '.txt'
+
+        Returns
+        -------
+        Dictionary with DataFrames; returned from __read_wd_data() or __read_wd_metadata() function
+        """
+        cachdir = Path(cachdir)  # Convert to pathlib object
+
+        # Extract wd_parameter name from URL
+        wd_parameter = zipurl.split('/')[-3]
+        wd_main_code = zipurl.split('/')[-1].split('_')[1]
+        logger.info(f"wd_parameter: {wd_parameter}, wd_main_code: {wd_main_code}")
+
+        result = None  # Ensure result is defined
+
+        # Download ZIP file to temp directory and process
+        with urlopen(zipurl) as zipresp, tempfile.NamedTemporaryFile(mode="wb", delete=False,
+                                                                     dir=cachdir.as_posix()) as tfile:
+            for chunk in iter(lambda: zipresp.read(1024 * 1024), b""):  # Read in 1MB chunks
+                tfile.write(chunk)
+
+        try:
+            if not zipfile.is_zipfile(tfile.name):
+                logger.warning(f"Downloaded file is not a valid ZIP archive: {tfile.name}. Skipping processing.")
+                return None
+
+            with zipfile.ZipFile(tfile.name) as zip_ref:
+                for file in zip_ref.namelist():
+                    if file.endswith(file_extension) and file.startswith(file_pattern):
+                        with zip_ref.open(file) as txt_file:
+                            if file_pattern == 'produkt':
+                                result = DWDData.__read_wd_data(self, txt_file, wd_parameter, wd_main_code,
+                                                                reject_nondef_parameters=True)
+                            elif file_pattern == 'Metadaten_Parameter':
+                                result = DWDData.__read_wd_metadata(self, txt_file, wd_parameter, wd_main_code)
+                            else:
+                                logger.info(
+                                    "Product with this pattern does not exist or read function not implemented.")
+
+        except zipfile.BadZipFile:
+            logger.error(f"Corrupt ZIP file: {tfile.name}")
+        except Exception as e:
+            logger.error(f"Error processing ZIP file: {e}")
+        finally:
+            os.unlink(tfile.name)  # Always delete temp file
+
+        return result
+
+
+    @staticmethod
+    def replace_nan(dataframe, nan_values=['nan', 'NaN'], set_value=None):
+        '''
+        converts all defined NaN values to None to be able import data to DB
+
+        Parameters
+        ----------
+        dataframe: pandas dataframe
+            dataframe values of which should be converted to None
+        nan_values: list of str
+            list of values to be seen as None,
+            intern np.nan is implemented
+
+        Returns
+        -------
+            dataframe with NaN values as None
+
+        '''
+        for i in nan_values:
+            dataframe = dataframe.replace(i, set_value)
+        # some how this needed for python3.6 otherwise it does not convert np.nan to None
+        dataframe = dataframe.replace({np.nan: None})
+        dataframe = dataframe.replace(np.nan, None)
+        return dataframe
+
+
+    @staticmethod
+    def check_column_existens_in_code(dataframe):
+        '''
+        checks if some colnames are not defined in dwd_downloader.custom.definitions.py
+
+        Parameters
+        ----------
+        dataframe: pandas dataframe
+
+        Returns
+        -------
+        list of parameter names that not defined in the dwd_downloader.custom.definitions.py
+        or prints message
+        '''
+        db_colnames = list(definitions.colnames_WDH.keys())
+        difference_columns = set(db_colnames).symmetric_difference(set(dataframe.columns.values.tolist()))
+        if difference_columns:
+            logger.info('Columns {} are not existing in DB_structure !:'.format(difference_columns))
+            return list(difference_columns)
+        else:
+            return 'All DWD columns are declared !'
+
+
+    @staticmethod
+    def unique_dict(data_list):
+        '''
+        convert list of dictionaries to list of unique dictionaries
+
+        Parameters
+        ----------
+        data_list: list of dictionaries
+
+        Returns
+        -------
+        list of unique dictionaries
+        '''
+        return OrderedDict((frozenset(item.items()), item) for item in data_list).values()
+
+    # ---------------------------------------------------------------
+    # main functions to ingest DWD data into DB
+    # ---------------------------------------------------------------
+    def query_pheno_stations(self, db, station=None, date=None, state=None, ingest=True, update=False, new_colname=None, colname_value=None):
+        '''
+        function to insert stations for DWD data type 'phenology' into DB
+        this data is stored under report_type = "historical"
+
+        Parameters
+        ----------
+        db:  <class 'dbflow.src.db_utility.RCMArchive'>
+        station: int or list of int
+            examp: [12508, 12615, 12561, 1757, 12709]...
+        ingest: boolean
+            if data must be inserted to db ingest=True, otherwise the dictionary will be returned; default: ingest=True
+        update: boolean
+            if data must be overwritten update=True; default: update=False
+        new_colname: str
+            name of the column to be added to a 'phenostations' table
+        colname_value: str
+            value to be added to a 'phenostations' table, if new_colname not None and colname_value is None, will add new column with value None
+
+        Returns
+        -------
+        dictionary of dictionaries
+                key: 'phenostations'
+                value: dictionary (dataframe with data converted to dictionary)
+        '''
+        if station != None:
+            if isinstance(station, int):
+                search_station = [station]
+            elif isinstance(station, list):
+                search_station = station
+            else:
+                logger.info('station is incorrect!')
+                return []
+        if state != None:
+            if isinstance(state, str):
+                state_list = [state]
+            elif isinstance(state, list):
+                state_list = state
+            else:
+                logger.info('state is incorrect!')
+                return []
+        if date != None:
+            # check and reformat input args
+            if isinstance(date, str):
+                date_start = datetime.strptime(date, '%Y%m%d%H')# str(date)
+                date_end = date_start
+            elif isinstance(date, list) and len(date) == 2:
+                date_start = datetime.strptime(date[0], '%Y%m%d%H') # min(date)
+                date_end = datetime.strptime(date[1], '%Y%m%d%H')  # max(date)
+            else:
+                logger.info('date is incorrect!')
+                return []
+
+        report_type = "historical"
+        stations, parameter_code = [], []
+        df_station, df_parameter_code = pd.DataFrame(), pd.DataFrame()
+
+        phen = DWDData(data_type=self.data_type, report_type=report_type, report_resolution=self.phen_report)
+        phen_dict = phen.build_url()
+        for phen_parameter, link in phen_dict.items():
+            logger.info('phenology: {}: {}'.format(phen_parameter, link))
+            # ----- Extract STATIONS
+            crops_dict = phen.extract_data(search_after=['PH_Beschreibung_Phaenologie_Stationen'], dwd_parameter_url=link)
+            if crops_dict and (phen_parameter == 'crops'):
+                for key, crops_link in crops_dict.items():
+                    # TO RETRIEVE WD_STATIONS >>> TXT file
+                    query_stations = phen.__read_phen_stations(txt_file=crops_link, phen_parameter=phen_parameter)
+                    df_st = query_stations['stations']
+                    df_unique_parameter_code = query_stations['pheno_parameter_code']
+                    # ---select after defined stations
+                    if station != None:
+                        df_st['station_id'] = df_st['station_id'].astype(int)
+                        df_st = df_st.loc[df_st['station_id'].isin(search_station)]
+                        if df_st.empty:
+                            logger.info('No data for station(s) was found !'.format(station))
+                    if date != None:
+                        # --- DWD_LEGEND data for table 'dwdcatalogue'
+                        df_st['date_stationliquidation'] = df_st['date_stationliquidation'].apply(lambda x: parse(str(x)).date() if not pd.isnull(x) else None)
+                        df_st = df_st.loc[(df_st['date_stationliquidation'] >= date_start.date()) | df_st[
+                            'date_stationliquidation'].isnull()]
+                        if df_st.empty:
+                            logger.info('No data for date period {} - {} was found !'.format(date_start.date(), date_end.date()))
+
+                    if state !=None:
+                        # --- DWD_LEGEND data for table 'dwdcatalogue'
+                        df_st = df_st.loc[df_st['state'].isin(state_list)]
+                        if df_st.empty:
+                            logger.info('No data for state was found !'.format(state))
+
+                    # store all stations in a main table
+                    #df_station = df_station.append(df_st) # depricated in pandas version 2.0
+                    df_station = pd.concat([df_station, df_st], ignore_index=True)
+                    #--- add new column with new value if needed =>>> AOI =='FRIEN'
+                    if (new_colname != None) and (colname_value != None):
+                        df_station[new_colname] = colname_value
+                    elif (new_colname != None) and (colname_value == None):
+                        df_station[new_colname] = None
+                    elif (new_colname == None) and (colname_value != None):
+                        logger.info('parameter colname_value should be defined !')
+                    #if not df_unique_parameter_code.empty:
+                    #df_parameter_code = df_parameter_code.append(df_unique_parameter_code) # depricated since pandas version 2.0
+                    df_parameter_code = pd.concat([df_parameter_code, df_unique_parameter_code], ignore_index=True)
+                #print(df_station['station_id'].values.tolist())
+                #print(df_station['date_stationliquidation'].values.tolist()[0])
+                #print(type(df_station['date_stationliquidation'].values.tolist()[0]))
+
+                #---- prepare data for insert
+                df_station = DWDData.replace_nan(df_station, nan_values=['nan', 'NaN'])
+                df_station['date_stationliquidation'] = df_station['date_stationliquidation'].apply(lambda x: cstm.sqldat_converter(x, to='datetime') if x is not None else x)
+                orderly_data_stations = df_station.to_dict(orient='records')
+                orderly_data_parameter_code = df_parameter_code.drop_duplicates().to_dict(orient='records')
+                stations = [*stations, *orderly_data_stations]
+                parameter_code = [*parameter_code, *orderly_data_parameter_code]
+                if ingest:
+                    db.insert(table='phenostations', primary_key=db.get_primary_keys('phenostations'), orderly_data=orderly_data_stations, update=update)
+                    db.insert(table='dwdparametercode', primary_key=db.get_primary_keys('dwdparametercode'), orderly_data=orderly_data_parameter_code, update=update)
+        if ingest == False:
+             return {
+                      'phenostations': DWDData.unique_dict(stations)
+                    , 'phenoparameter_code': DWDData.unique_dict(parameter_code)
+                    }
+
+
+    def query_pheno_data(self, db, crop=None, date=None, station=None, ingest=True, update=False, new_colname=None,
+                         colname_value=None):
+        """
+        Main method to insert measurements and metadata for DWD data type 'phenology' into the database.
+        """
+        # Process parameters (crop, date, station) and initialize data storage
+        search_crops, date_range, search_station = self._process_parameters(crop, date, station)
+        anomaly, metadata, measurements, dwdlegend = [], [], [], []
+        #df_data, df_metadata, dwd_legend = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+        phen = DWDData(data_type=self.data_type, report_type=self.report_type, report_resolution=self.phen_report)
+        logger.info(
+            f'datatype: {self.data_type} - report_type: {self.report_type} - report_resolution: {self.phen_report}')
+
+        # Extract measurements and insert them if ingesting
+        measurements, dwd_legend = self._extract_and_insert_measurements(
+            phen, search_crops, date_range, search_station, new_colname, colname_value, db, ingest, update
+        )
+
+        # Extract metadata and insert it if ingesting
+        metadata = self._extract_and_insert_metadata(phen, db, ingest, update)
+
+        #  Extract anomalies if report_type is 'historical' and insert if ingesting
+        if self.report_type == "historical":
+            anomaly = self._extract_and_insert_anomalies(phen, db, ingest, update)
+
+        # Return the collected data if not ingesting
+        if not ingest:
+            return {
+                'phenodata': DWDData.unique_dict(measurements),
+                'phenometadata': DWDData.unique_dict(metadata),
+                'phenoanomaly': DWDData.unique_dict(anomaly),
+                'dwdcatalogue': DWDData.unique_dict(dwdlegend),
+            }
+
+
+    def _process_parameters(self, crop, date, station):
+        """ Helper function to process and validate crop, date, and station parameters. """
+        # Crop validation
+        search_crops = [crop] if isinstance(crop, str) else crop or []
+        # Date validation
+        date_range = self._parse_date_range(date)
+        # Station validation
+        search_station = [station] if isinstance(station, int) else station or []
+        return search_crops, date_range, search_station
+
+
+    def _parse_date_range(self, date):
+        """ Helper function to parse the date parameter and return a tuple (start_year, end_year). """
+        if isinstance(date, str):
+            date_start = date_end = datetime.strptime(date, '%Y%m%d%H').year
+        elif isinstance(date, list) and len(date) == 2:
+            date_start = datetime.strptime(date[0], '%Y%m%d%H').year
+            date_end = datetime.strptime(date[1], '%Y%m%d%H').year
+        else:
+            logger.info("Invalid date parameter format.")
+            return None, None
+        return date_start, date_end
+
+
+    def _extract_and_insert_measurements(self, phen, search_crops, date_range, search_station, new_colname,
+                                         colname_value, db, ingest, update):
+        """ Helper function to extract and insert measurement data. """
+        measurements, dwd_legend = [], pd.DataFrame()
+
+        # Initialize data frames to prevent UnboundLocalError
+        df_data = pd.DataFrame()
+        #dfrm_phen = pd.DataFrame()
+        #dwd_legend = pd.DataFrame()
+        #dfrm_dwdlegend = pd.DataFrame()
+
+        phen_dict = phen.build_url()
+        for phen_parameter, link in phen_dict.items():
+            logger.info(f'phenology: {phen_parameter}: {link}')
+
+            # Extract MEASUREMENTS for specified crops
+            crops_dict = phen.extract_data(search_after=search_crops, dwd_parameter_url=link)
+            if crops_dict:
+                for crops_link in crops_dict.values():
+                    query_data = phen.__read_phen_data(txt_file=crops_link)
+
+                    # Assign extracted data to initialized variables
+                    df_phen = query_data.get('measurements', pd.DataFrame())
+                    df_dwdlegend = query_data.get('dwd_legend', pd.DataFrame())
+
+
+                    # Filter data by date and station
+                    dfrm_phen, dfrm_dwdlegend = self._filter_data_by_date_and_station(
+                        df_phen, df_dwdlegend, date_range, search_station
+                    )
+
+                    # Prepare and collect measurements data
+                    df_data, dwd_legend = self._prepare_measurement_data(
+                        df_data, dfrm_phen, dwd_legend, dfrm_dwdlegend, new_colname, colname_value
+                    )
+
+                    # Insert data if ingesting
+                    if ingest:
+                        logger.info("Inserting data into table 'phenodata'.")
+                        db.insert('phenodata', primary_key=db.get_primary_keys('phenodata'),
+                                  orderly_data=df_data.to_dict(orient='records'), update=update)
+
+                    # Collect all measurements for return
+                    measurements.extend(df_data.to_dict(orient='records'))
+
+        return measurements, dwd_legend
+
+
+    def _extract_and_insert_metadata(self, phen, db, ingest, update):
+        """ Helper function to extract and insert metadata, including unique codes for phases and objects. """
+        metadata = []
+        phen_dict = phen.build_url()
+
+        for _, link in phen_dict.items():
+            crops_dict = phen.extract_data(search_after=['Phasendefinition'], dwd_parameter_url=link)
+            for crops_link in crops_dict.values():
+                query_metadata = phen.__read_phen_phasedefenition(txt_file=crops_link)
+                df_meta = query_metadata['metadata']
+                df_object_code = query_metadata['object_unique_code']
+                df_phase_code = query_metadata['phase_unique_code']
+
+                # Insert metadata and unique codes if ingesting
+                if ingest:
+                    db.insert('phenometadata', primary_key=db.get_primary_keys('phenometadata'),
+                              orderly_data=df_meta.to_dict(orient='records'), update=update)
+                    db.insert('phenoobjectcode', primary_key=db.get_primary_keys('phenoobjectcode'),
+                              orderly_data=df_object_code.to_dict(orient='records'), update=update)
+                    db.insert('phenophasecode', primary_key=db.get_primary_keys('phenophasecode'),
+                              orderly_data=df_phase_code.to_dict(orient='records'), update=update)
+
+                metadata.extend(df_meta.to_dict(orient='records'))
+
+        return metadata
+
+
+    def _extract_and_insert_anomalies(self, phen, db, ingest, update):
+        """ Helper function to extract and insert anomaly data. """
+        anomaly = []
+        phen_dict = phen.build_url()
+
+        for phen_parameter, link in phen_dict.items():
+            crops_dict = phen.extract_data(search_after=['Besonderheiten'], dwd_parameter_url=link)
+            for crops_link in crops_dict.values():
+                query_metadata = phen.__read_phen_anomaly(txt_file=crops_link, phen_parameter=phen_parameter)
+                df_anomaly = query_metadata['metadata']
+
+                # Insert anomaly data if ingesting
+                if ingest:
+                    db.insert('phenoanomaly', primary_key=db.get_primary_keys('phenoanomaly'),
+                              orderly_data=df_anomaly.to_dict(orient='records'), update=update)
+
+                anomaly.extend(df_anomaly.to_dict(orient='records'))
+
+        return anomaly
+
+
+    def _filter_data_by_date_and_station(self, df_phen, df_dwdlegend, date_range, search_station):
+        """ Helper function to filter data by date and station. """
+
+        if date_range:
+            # Convert 'reference_year' to integers, handling non-numeric values if necessary
+            df_phen['reference_year'] = pd.to_numeric(df_phen['reference_year'], errors='coerce').fillna(0).astype(int)
+            df_dwdlegend['reference_year'] = pd.to_numeric(df_dwdlegend['reference_year'], errors='coerce').fillna(
+                0).astype(int)
+
+            date_start, date_end = date_range
+            df_phen = df_phen[(df_phen['reference_year'] >= date_start) & (df_phen['reference_year'] <= date_end)]
+            df_dwdlegend = df_dwdlegend[
+                (df_dwdlegend['reference_year'] >= date_start) & (df_dwdlegend['reference_year'] <= date_end)]
+
+        if search_station:
+            df_phen = df_phen[df_phen['station_id'].isin(search_station)]
+            df_dwdlegend = df_dwdlegend[df_dwdlegend['station_id'].isin(search_station)]
+
+        return df_phen, df_dwdlegend
+
+
+    def _prepare_measurement_data(self, df_data, dfrm_phen, dwd_legend, dfrm_dwdlegend, new_colname, colname_value):
+        """ Helper function to prepare measurement data with new column additions. """
+        dfrm_phen = DWDData.replace_nan(dfrm_phen, nan_values=['nan', 'NaN'])
+        df_data = pd.concat([df_data, dfrm_phen], ignore_index=True)
+        dfrm_dwdlegend = dfrm_dwdlegend.rename(columns={'reference_year': 'year'})
+        dwd_legend = pd.concat([dwd_legend, dfrm_dwdlegend], ignore_index=True)
+
+        # Add new column if required
+        if new_colname is not None:
+            dwd_legend[new_colname] = colname_value if colname_value is not None else None
+
+        return df_data, dwd_legend
+
+
+    def query_weather_stations(self, db, station=None, date=None, state=None, ingest=True, update=False, new_colname=None, colname_value=None):
+        '''
+        function to insert stations for DWD data type 'climate' into DB
+
+        Parameters
+        ----------
+        db:  <class 'dbflow.src.db_utility.RCMArchive'>
+        station: int or list of int
+            examp: [1207, 167, 1270]...
+        ingest: boolean
+            if data must be inserted to db ingest=True, otherwise the dictionary will be returned; default: ingest=True
+        update: boolean
+            if data must be overwritten update=True; default: update=False
+         new_colname: str
+            name of the column to be added to a 'weahterstations' table
+         colname_value: str
+            value to be added to a 'weahterstations' table, if new_colname not None and colname_value is None, will add new column with value None
+
+        Returns
+        -------
+        dictionary of dictionaries
+                key: 'weatherstations'
+                value: dictionary (dataframe with data converted to dictionary)
+        '''
+        if date != None:
+            # check and reformat input args
+            if isinstance(date, str):
+                date_start = datetime.strptime(date, '%Y%m%d%H') # str(date)
+                #TODO: make date + 1 !!!
+                # date_end = datetime.strptime(date, '%Y%m%d%H') + 1
+            elif isinstance(date, list) and len(date) == 2:
+                date_start = datetime.strptime(date[0], '%Y%m%d%H') # min(date)
+                date_end = datetime.strptime(date[1], '%Y%m%d%H') # max(date)
+            else:
+                logger.info('date is incorrect!')
+                return []
+        if station != None:
+            if isinstance(station, int):
+                search_station = [station]
+            elif isinstance(station, list):
+                search_station = station
+            else:
+                logger.info('station is incorrect!')
+                return []
+        if state != None:
+            if isinstance(state, str):
+                state_list = [state]
+            elif isinstance(state, list):
+                state_list = state
+            else:
+                logger.info('state is incorrect!')
+                return []
+
+        stations = []
+        df_station = pd.DataFrame()
+        wd = DWDData(data_type=self.data_type, report_type=self.report_type, report_resolution=self.wd_report)
+        wd_dict = wd.build_url()
+        for dwd_parameter, link in wd_dict.items():
+            #print('climate: {}: {}'.format(dwd_parameter, link))
+
+            # ----- Extract STATIONS
+            stations_dict = wd.extract_data(search_after=['Beschreibung_Stationen'], dwd_parameter_url=link)
+            # TODO: for solar nor 'recent' & historical, implement extract_climate_data() without 'recent' and 'historical' if needed
+            if stations_dict and (dwd_parameter != 'solar'):
+                for key, stations_link in stations_dict.items():
+                    wd_main_code = stations_link.split('/')[-1].split('_')[0]
+                    logger.info(wd_main_code)
+                    logger.info(stations_link)
+                    query_stations = wd.__read_wd_stations(txt_file=stations_link) #>>> TXT file # , wd_parameter=dwd_parameter, wd_main_code=wd_main_code
+                    df_st = query_stations['stations']
+                    #print(df_st.station_id.unique())
+                    #TODO: rewrite it as args* selection by multiple columns!!!
+                    if station != None:
+                        df_st['station_id'] = df_st['station_id'].astype(int)
+                        df_st = df_st.loc[df_st['station_id'].isin(search_station)]
+                        if df_st.empty:
+                            logger.info('No data for station(s) was found !'.format(station))
+                    if date != None:
+                        # --- DWD_LEGEND data for table 'dwdcatalogue'
+                        df_st['date_start'] = df_st['date_start'].apply(lambda x: parse(x).date())
+                        df_st['date_end'] = df_st['date_end'].apply(lambda x: parse(x).date())
+                        df_st = df_st.loc[(df_st['date_end'] >= date_end.date()) | (df_st['date_end'] >= date_start.date())]
+                        if df_st.empty:
+                            logger.info('No data for date period {} - {} was found !'.format(date_start.date(), date_end.date()))
+                    if state !=None:
+                        # --- DWD_LEGEND data for table 'dwdcatalogue'
+                        df_st = df_st.loc[df_st['state'].isin(state_list)]
+                        if df_st.empty:
+                            logger.info('No data for state was found !'.format(state))
+                    #df_station = df_station.append(df_st)
+                    df_station = pd.concat([df_station, df_st], ignore_index=True)
+
+                # --- add new column with new value if needed =>>> AOI =='FRIEN'
+                if (new_colname != None) and (colname_value != None):
+                    df_station[new_colname] = colname_value
+                elif (new_colname != None) and (colname_value == None):
+                    df_station[new_colname] = None
+                elif (new_colname == None) and (colname_value != None):
+                    logger.info('parameter colname_value should be defined !')
+            orderly_data_stations = df_station.to_dict(orient='records')
+            # to collect all dictionaries for a return
+            stations = [*stations, *orderly_data_stations]
+            if ingest == True:
+                db.insert(table='weatherstations', primary_key=db.get_primary_keys('weatherstations'), orderly_data=orderly_data_stations, update=update)
+        if ingest == False:
+            return {
+                    'weatherstations': DWDData.unique_dict(stations)
+                    }
+
+
+    def query_weather_data(self, db, parameter=None, date=None, station=None, tempdir=None, ingest=True, update=False,
+                           new_colname=None, colname_value=None):
+        """
+        Main method to insert measurements and metadata for DWD data type 'climate' into the database.
+        """
+        # Process input parameters
+        date_start, date_end = self._process_date_param(date)
+        search_station = self._process_station_param(station)
+        search_param = self._process_parameter_param(parameter)
+
+        # Initialize data storage
+        metadata, measurements, dwdlegend, dwdparametercode, datactaloguelegend = [], [], [], [], []
+
+        # Extract data for each station
+        wd = DWDData(data_type=self.data_type, report_type=self.report_type, report_resolution=self.wd_report)
+        wd_dict = wd.build_url()
+
+        for aoi_station in search_station:
+            # Extract measurements for the current station with parameter filtering
+            measurements.extend(
+                self._extract_measurements(wd, wd_dict, aoi_station, date_start, date_end, tempdir, db, ingest, update,
+                                           search_param)
+            )
+
+        # Extract metadata if `station` parameter is None
+        if station is None:
+            search_station = self._gather_stations_by_date(wd, wd_dict, date_start, date_end)
+
+        # Extract metadata and dwd_legend for catalog tables
+        for aoi_station in search_station:
+            metadata, dwdlegend, dwdparametercode, datactaloguelegend = self._extract_metadata_and_legend(
+                wd, wd_dict, aoi_station, tempdir, db, ingest, update, new_colname, colname_value, date_start, date_end
+            )
+
+        # Return data if `ingest` is False
+        if not ingest:
+            return {
+                'weatherdata': DWDData.unique_dict(measurements),
+                'weathermetadata': DWDData.unique_dict(metadata),
+                'dwdparametercode': DWDData.unique_dict(dwdparametercode),
+                'dwdcatalogue': DWDData.unique_dict(dwdlegend),
+                'datacatalogue': DWDData.unique_dict(datactaloguelegend),
+            }
+
+
+    def _process_date_param(self, date):
+        """ Helper to process the date parameter and return datetime start and end objects. """
+        if isinstance(date, str):
+            date_start = datetime.strptime(date, '%Y%m%d%H')
+            date_end = date_start  # Single date
+        elif isinstance(date, list) and len(date) == 2:
+            date_start = datetime.strptime(date[0], '%Y%m%d%H')
+            date_end = datetime.strptime(date[1], '%Y%m%d%H')
+        else:
+            logger.info('Invalid date parameter format.')
+            return None, None
+        return date_start, date_end
+
+
+    def _process_station_param(self, station):
+        """ Helper to process station parameter into a list format for consistency. """
+        if isinstance(station, int):
+            return [station]
+        elif isinstance(station, list):
+            return station
+        else:
+            logger.info('Invalid station parameter format.')
+            return []
+
+
+    def _process_parameter_param(self, parameter):
+        """ Helper to process parameter input into a list format for consistency. """
+        if isinstance(parameter, str):
+            return [parameter]
+        elif isinstance(parameter, list):
+            return parameter
+        else:
+            logger.info('Invalid parameter format.')
+            return []
+
+    def _extract_measurements(self, wd, wd_dict, aoi_station, date_start, date_end, tempdir, db, ingest, update,
+                              search_param):
+        """ Extracts and processes measurements data for each station, filtered by parameters if provided. """
+        measurements = []
+
+        for dwd_parameter, link in wd_dict.items():
+            # Skip if dwd_parameter is not in search_param
+            if search_param and dwd_parameter not in search_param:
+                continue
+
+            data_dict = wd.extract_data(search_after=aoi_station, dwd_parameter_url=link)
+
+            for wd_stations, txt_link in data_dict.items():
+                print(txt_link)
+                query_data = wd.__retrive_files(zipurl=txt_link, cachdir=tempdir, file_pattern='produkt',
+                                                file_extension='.txt')
+                df_wd = query_data['measurements']
+
+                if not df_wd.empty:
+                    # Convert datetime and filter by date
+                    df_wd['datetime'] = pd.to_datetime(df_wd['datetime'], format='%Y%m%d%H')
+                    dfrm_wd = df_wd[(df_wd['datetime'] >= date_start) & (df_wd['datetime'] <= date_end)]
+
+                    if not dfrm_wd.empty:
+                        dfrm_wd['quality_level'] = dfrm_wd['quality_level'].astype(int)
+                        dfrm_wd['datetime'] = dfrm_wd['datetime'].apply(
+                            lambda x: cstm.sqldat_converter(x, to='datetime'))
+
+                        dfrm_wd = DWDData.replace_nan(dfrm_wd, nan_values=['nan', 'NaN'])
+                        orderly_data_observ = dfrm_wd.to_dict(orient='records')
+                        measurements.extend(orderly_data_observ)
+
+                        if ingest:
+                            db.insert('weatherdata', primary_key=db.get_primary_keys('weatherdata'),
+                                      orderly_data=orderly_data_observ, update=update)
+
+        return measurements
+
+
+    def _gather_stations_by_date(self, wd, wd_dict, date_start, date_end):
+        """ Helper to gather all stations by date range if `station` is None. """
+        search_station_collection = []
+
+        for dwd_parameter, link in wd_dict.items():
+            data_dict = wd.extract_data(search_after=['stundenwerte'], dwd_parameter_url=link)
+
+            for wd_stations, txt_link in data_dict.items():
+                station = wd_stations.split('_')[2]
+
+                if self.report_type == 'historical':
+                    sdate = parse(wd_stations.split('_')[3]).date()
+                    edate = parse(wd_stations.split('_')[4]).date()
+                    if (sdate >= date_start.date()) or (edate <= date_end.date()):
+                        search_station_collection.append(station)
+                elif self.report_type == 'recent':
+                    search_station_collection.append(station)
+
+        return search_station_collection
+
+
+    def _extract_metadata_and_legend(self, wd, wd_dict, aoi_station, tempdir, db, ingest, update, new_colname,
+                                     colname_value, date_start, date_end):
+        """
+        Extracts and processes metadata, dwdparametercode, and dwd_legend for catalog tables.
+
+        Parameters
+        ----------
+        wd : DWDData
+            DWDData object used for building URLs and retrieving files.
+        wd_dict : dict
+            Dictionary of DWD data URLs.
+        aoi_station : int
+            Station ID for which data should be extracted.
+        tempdir : str
+            Temporary directory to cache and extract files.
+        db : RCMArchive
+            Database connection object for inserting data.
+        ingest : bool
+            Flag to determine whether to insert data into the database.
+        update : bool
+            Flag to determine if existing data should be updated in the database.
+        new_colname : str
+            Optional name of the new column to add.
+        colname_value : str
+            Value for the new column if provided.
+        date_start : datetime
+            Start date for filtering legend data.
+        date_end : datetime
+            End date for filtering legend data.
+
+        Returns
+        -------
+        tuple
+            Returns a tuple containing lists of metadata, dwdlegend, dwdparametercode, and datactaloguelegend.
+        """
+        metadata, dwdlegend, dwdparametercode, datactaloguelegend = [], [], [], []
+
+        for dwd_parameter, link in wd_dict.items():
+            logger.info(f"Processing DWD parameter: {dwd_parameter}, link: {link}")
+
+            data_dict = wd.extract_data(search_after=aoi_station, dwd_parameter_url=link)
+
+            for wd_stations, txt_link in data_dict.items():
+                logger.info(f"Processing station: {wd_stations}, extracting data from: {txt_link}")
+
+                query_metadata = wd.__retrive_files(zipurl=txt_link, cachdir=tempdir,
+                                                    file_pattern='Metadaten_Parameter', file_extension='.txt')
+                df_meta = query_metadata['metadata']
+                wd_parameter_code = query_metadata['wd_parameter_code']
+                df_dwdlegend = query_metadata['dwd_legend']
+
+                # Process metadata and parameter code
+                if not df_meta.empty:
+                    df_meta = DWDData.replace_nan(df_meta, nan_values=['nan', 'NaN'])
+                    orderly_data_meta = df_meta.to_dict(orient='records')
+                    orderly_date_paramcode = wd_parameter_code.to_dict(orient='records')
+
+                    metadata.extend(orderly_data_meta)
+                    dwdparametercode.extend(orderly_date_paramcode)
+
+                    if ingest:
+                        logger.info(
+                            "Inserting metadata and parameter code into database tables 'weathermetadata' and 'dwdparametercode'")
+                        db.insert('weathermetadata', primary_key=db.get_primary_keys('weathermetadata'),
+                                  orderly_data=orderly_data_meta, update=update)
+                        db.insert('dwdparametercode', primary_key=db.get_primary_keys('dwdparametercode'),
+                                  orderly_data=orderly_date_paramcode, update=update)
+
+                # Process DWD Legend data with date filtering
+                if not df_dwdlegend.empty:
+                    df_dwdlegend['date_start'] = pd.to_datetime(df_dwdlegend['date_start'])
+                    df_dwdlegend['date_end'] = pd.to_datetime(df_dwdlegend['date_end'])
+                    dfrm_dwdlegend = df_dwdlegend[
+                        (df_dwdlegend['date_start'] <= date_start) & (df_dwdlegend['date_end'] >= date_end)]
+
+                    if not dfrm_dwdlegend.empty:
+                        dfrm_dwdlegend = dfrm_dwdlegend.drop_duplicates()
+                        logger.info(f"Filtered DWD legend data for station {aoi_station} and date range.")
+
+                        year_frame = cfg.generate_year_list(str(date_start), str(date_end))
+                        for year in year_frame:
+                            dfrm_dwdlegend['year'] = year
+
+                        dfrm_dwdlegend = dfrm_dwdlegend.drop(columns=['date_start', 'date_end'])
+                        dwdlegend.extend(dfrm_dwdlegend.to_dict(orient='records'))
+
+                    # Validate and add new column  and add new column if specified
+                    if new_colname:
+                        if colname_value is None:
+                            raise ValueError(
+                                f"Error: Both 'new_colname' and 'colname_value' must be defined. "
+                                f"Received new_colname='{new_colname}' without a valid colname_value."
+                            )
+                        dfrm_dwdlegend[new_colname] = colname_value
+                    elif colname_value is not None:
+                        raise ValueError(
+                            f"Error: 'colname_value' is specified as '{colname_value}' without a corresponding 'new_colname'. "
+                            f"Please define 'new_colname' to match the table structure."
+                        )
+
+                    # Process data legend for `datacatalogue`
+                    data_legend = dfrm_dwdlegend[['year', 'aoi', 'datatype_code', 'parameter']].rename(
+                        columns={'parameter': 'datatype_name'})
+                    data_legend['datatype'] = 'quantitative'
+                    data_legend['source'] = 'Deutsche Wetterdienst'
+                    data_legend['datatype_description'] = None
+                    datactaloguelegend.extend(data_legend.drop_duplicates().to_dict(orient='records'))
+
+                    if ingest:
+                        logger.info("Inserting legend data into database tables 'dwdcatalogue' and 'datacatalogue'")
+                        db.insert('dwdcatalogue', primary_key=db.get_primary_keys('dwdcatalogue'),
+                                  orderly_data=dwdlegend, update=update)
+                        db.insert('datacatalogue', primary_key=db.get_primary_keys('datacatalogue'),
+                                  orderly_data=datactaloguelegend, update=update)
+
+        return metadata, dwdlegend, dwdparametercode, datactaloguelegend
+
+
+def loadwd2(
+            start_date=cfg.start_date,
+            end_date=cfg.end_date,
+            #study_area=list(cfg.aoi_dict.keys()),
+            study_area=['FRIEN'],
+            crops=['Sommergerste', 'Sommerweizen', 'Winterweizen', 'Winterraps', 'Mais', 'Zucker-Rübe'],
+            tempdir=cfg.dwd_catch_folder,
+            rcmarchive=None
+            ):
+
+    START_DATE = date.strftime(parse(start_date), '%Y%m%d%H')
+    END_DATE = date.strftime(parse(end_date), '%Y%m%d%H')
+
+    year = cfg.generate_year_list(start_date, end_date)
+    # collect all possible combinations of element pairs in one list
+    pattern_list = [(AOI, YEAR) for AOI in study_area for YEAR in year]
+
+    '''
+    # TODO: Implement deleting Table from DB !!! select Update or Load !!!!
+    #---- PHENO DATA
+    phen_hist_immediate = DWDData(data_type="phenology", report_type="historical", report_resolution="immediate")
+    phen_hist_annual = DWDData(data_type="phenology", report_type="historical", report_resolution="annual")
+    phen_recent_immediate = DWDData(data_type="phenology", report_type="recent", report_resolution="immediate")
+    phen_recent_annual = DWDData(data_type="phenology", report_type="recent", report_resolution="annual")
+    '''
+    # ---- WEATHER DATA only hourly!!
+    wd_recent_hourly = DWDData(data_type="climate", report_type="recent", report_resolution="hourly")
+    wd_hist_hourly = DWDData(data_type="climate", report_type="historical", report_resolution="hourly")
+
+    #wd_recent_hourly.query_weather_stations(db=rcmarchive)
+    #wd_hist_hourly.query_weather_stations(db=rcmarchive)
+
+
+    # --------- run processing for each AOI
+    for (AOI, YEAR) in pattern_list:
+        print("aoi:", AOI, " --- year:", YEAR)
+        '''
+        #------- Insert STATIONS
+        # imports the same station as for (report_type="historical", report_resolution="immediate") and ("historical", report_resolution="annual")
+        pheno_stations = cfg.pheno_stations[AOI]
+        phen_hist_immediate.query_pheno_stations(db=rcmarchive, station=pheno_stations, ingest=True, update=False)
+        phen_hist_annual.query_pheno_stations(db=rcmarchive, station=pheno_stations, ingest=True, update=False)
+        #print(query)
+        # TODO: Implement selection after stations into query_pheno_stations() and crop types !!!!! no main_object in stations txt file!!
+        # TODO: update=False, does not work for geometries!!!
+        # TODO: change the Documentation!!
+
+        # ------- Insert DATA
+        phen_recent_immediate.query_pheno_data(db=rcmarchive, crop=crops, date=[START_DATE, END_DATE], station=pheno_stations, ingest=True, update=False)
+        phen_recent_annual.query_pheno_data(db=rcmarchive, crop=crops, date=[START_DATE, END_DATE], station=pheno_stations)
+        phen_hist_immediate.query_pheno_data(db=rcmarchive, crop=crops, date=[START_DATE, END_DATE], station=pheno_stations, ingest=True, update=False) #UPDATE does not work!!
+        phen_hist_annual.query_pheno_data(db=rcmarchive, crop=crops, date=[START_DATE, END_DATE], station=pheno_stations)
+        '''
+
+        #---- WEATHER DATA only hourly!!
+        wd_stations = cfg.wd_stations[AOI]
+        #wd_recent_hourly.query_weather_data(db=rcmarchive, station=wd_stations, date=[START_DATE, END_DATE], tempdir=tempdir, ingest=False)
+        wd_hist_hourly.query_weather_data(db=rcmarchive,
+                                          date=[START_DATE, END_DATE],
+                                          station=wd_stations,
+                                          tempdir=tempdir,
+                                          ingest=True,
+                                          update=False,
+                                          new_colname='aoi',
+                                          colname_value=AOI)
+
+
+
+if __name__ == '__main__':
+
+    # connect to db
+    dbarchive = connect2db(cfg.db_path)
+
+    loadwd2(
+        start_date='2020-10-15',
+        end_date='2020-12-10',
+        #crops = ['Sommergerste', 'Sommerweizen']
+        #study_area=['FRIEN'],
+        rcmarchive=dbarchive
+        )
+
+
