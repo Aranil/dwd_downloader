@@ -6,10 +6,42 @@ This is a script to run functions defined in DB_utility_dwd.py to web-scrap data
 """
 from datetime import date
 from dateutil.parser import parse
+import numpy as np
 from dbflow.src.db_utility import connect2db, create_sql, query_sql
 
 from dwd_downloader import config as cfg
 import DB_utility_dwd as db_dwd
+
+
+
+# additional functions for submodules
+def generate_year_list(start_date, end_date):
+    '''
+    Helper function - generates list of years through definition of the start and end date
+
+    Parameters
+    ----------
+    start_date: str
+        date to start a search, only the year will be extracted
+    end_date
+        date to stop search, only the year will be extracted
+    Returns
+    -------
+        list of str
+            list of years (i.g. ['2017', '2018'])
+    '''
+    START_DATE = parse(start_date)
+    END_DATE = parse(end_date)
+
+    # generate year list
+    if START_DATE.year != END_DATE.year:
+        year = np.arange(START_DATE.year, END_DATE.year + 1, 1).tolist()
+        return [str(x) for x in year]
+    else:
+        return [str(START_DATE.year)]
+
+
+
 
 
 # connect to DB - will automatically create DB if not exist in the location defined in .env file
@@ -29,7 +61,7 @@ def loadwd2(
     START_DATE = date.strftime(parse(start_date), '%Y%m%d%H')
     END_DATE = date.strftime(parse(end_date), '%Y%m%d%H')
 
-    year = cfg.generate_year_list(start_date, end_date)
+    year = generate_year_list(start_date, end_date)
 
     # collect all possible combinations of element pairs in one list
     pattern_list = [(AOI, YEAR) for AOI in study_area for YEAR in year]
