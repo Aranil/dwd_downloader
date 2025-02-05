@@ -1,0 +1,15 @@
+# Include important project-level files
+include README.md
+include LICENSE
+include setup.py
+
+# Include all Python files in the dwd_downloader package
+recursive-include dwd_downloader *.py
+
+# Include data files in the dwd_downloader package
+recursive-include dwd_downloader *.json
+recursive-include dwd_downloader *.txt
+
+# Exclude unnecessary files
+exclude *.log
+prune tests/
