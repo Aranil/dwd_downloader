@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use dwd_downloader in your work, please cite it as below."
+title: "dwd_downloader"
+version: "1.0.0"
+authors:
+  - family-names: "Arslanova"
+    given-names: "Linara"
+    orcid: "https://orcid.org/0009-0002-5354-7344"
+date-released: 2025-02-05
+url: "https://github.com/Aranil/dwd_downloader"
+repository-code: "https://github.com/Aranil/dwd_downloader"
+license: "MIT"
+type: "software"
+abstract: "This module is a customized extension of dbflow, designed to automate downloading DWD (Deutscher Wetterdienst) data from the FTP server and store it in an SQLite database. It leverages web scraping technique."
+acknowledgements: >
+    This project was carried out in the frame of the project *Radar-Crop-Monitor*, which was financed by the Federal Ministry for Economic Affairs and Climate Action (BMWK), Germany, under the support code FKZ: 50EE1901.
